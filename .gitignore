@@ -9,3 +9,4 @@ config.yaml
 *.egg-info/
 dist/
 uv.lock
+mcp/openbrain.json
