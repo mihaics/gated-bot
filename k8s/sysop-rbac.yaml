@@ -1,0 +1,108 @@
+---
+# ServiceAccount for SysOp bot
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sysop-bot
+  namespace: default
+---
+# ClusterRole: broad read + safe write operations
+# Philosophy: read everything, mutate deployments/services/configs,
+# but NEVER touch databases (StatefulSets, PVCs) or cluster-level resources
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sysop-bot
+rules:
+  # ── Read-only on everything ──
+  - apiGroups: ["", "apps", "batch", "networking.k8s.io", "autoscaling", "policy"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+
+  # Also read CRDs, events, metrics
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["nodes", "pods"]
+    verbs: ["get", "list"]
+
+  # ── Pod operations (debugging) ──
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]           # delete individual pods (triggers restart)
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["pods/portforward"]
+    verbs: ["create"]
+
+  # ── Deployments (scale, restart, update) ──
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["patch", "update"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["patch", "update"]
+
+  # ── ConfigMaps and Secrets (update configs) ──
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "patch", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "patch", "update", "delete"]
+
+  # ── Services and Ingresses ──
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["create", "patch", "update", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["create", "patch", "update", "delete"]
+
+  # ── HPA (adjust autoscaling) ──
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["create", "patch", "update", "delete"]
+
+  # ── Jobs and CronJobs ──
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["create", "patch", "update", "delete"]
+
+  # ── Rollouts ──
+  - apiGroups: ["apps"]
+    resources: ["deployments/rollback"]
+    verbs: ["create"]
+
+  # ─────────────────────────────────────────────
+  # EXPLICITLY NOT GRANTED (deny by omission):
+  # - StatefulSets: no create/update/delete/patch
+  # - PersistentVolumeClaims: no create/update/delete
+  # - PersistentVolumes: no create/update/delete
+  # - Namespaces: no create/delete
+  # - Nodes: no cordon/drain/delete
+  # - ClusterRoles/ClusterRoleBindings: no mutation
+  # - DaemonSets: no mutation
+  # - ServiceAccounts: no mutation
+  # - CRDs: no mutation
+  # ─────────────────────────────────────────────
+---
+# Bind the ClusterRole to the ServiceAccount
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sysop-bot
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sysop-bot
+subjects:
+  - kind: ServiceAccount
+    name: sysop-bot
+    namespace: default

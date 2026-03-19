@@ -1,0 +1,30 @@
+[project]
+name = "sysop"
+version = "0.1.0"
+description = "SysOp - Virtual DevOps Engineer - Slack bot POC"
+requires-python = ">=3.11"
+dependencies = [
+    "slack-bolt>=1.18",
+    "slack-sdk>=3.27",
+    "aiosqlite>=0.20",
+    "pyyaml>=6.0",
+    "aiohttp>=3.9",
+    "python-dotenv>=1.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["sysop*"]
+exclude = ["hooks*", "persona*", "mcp*"]
+
+[project.scripts]
+sysop = "sysop.main:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]

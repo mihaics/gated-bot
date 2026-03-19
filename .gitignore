@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+config.yaml
+.env
+*.db
+/tmp/
+.claude/
+*.egg-info/
+dist/
+uv.lock

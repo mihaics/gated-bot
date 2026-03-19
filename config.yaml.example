@@ -1,0 +1,36 @@
+# SysOp Configuration
+# Copy to config.yaml and fill in your values.
+# Supports ${ENV_VAR} substitution.
+
+slack:
+  app_token: ${SLACK_APP_TOKEN}
+  bot_token: ${SLACK_BOT_TOKEN}
+
+kubeconfig: /path/to/sysop-bot.kubeconfig
+git_repo_path: /path/to/your/platform-repo
+git_branch: main
+github_bot_user: sysop-bot
+
+openbrain:
+  # Path to MCP config JSON for openbrain. Leave empty to inherit from
+  # global Claude Code settings (~/.claude/settings.json).
+  mcp_config: ""  # e.g., ./mcp/openbrain.json
+
+audit:
+  db_path: ./sysop_audit.db
+
+gates:
+  timeout_seconds: 300
+  require_initiator_approval: true
+  kubectl_read_commands: [get, describe, logs, top, explain, api-resources]
+  kubectl_deny_commands: [delete namespace, delete clusterrole, delete clusterrolebinding, delete pv, delete node]
+  bash_gate_patterns: [kubectl, git, helm]
+
+claude:
+  max_turns: 50
+  persona_claude_md: ./persona/CLAUDE.md
+
+session:
+  idle_timeout_seconds: 1800
+  socket_dir: /tmp/sysop
+  max_queue_per_thread: 3

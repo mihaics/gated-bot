@@ -1,0 +1,4 @@
+slack-bolt[async]>=1.18
+slack-sdk>=3.27
+aiosqlite>=0.20
+pyyaml>=6.0
