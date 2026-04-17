@@ -37,11 +37,16 @@ class SessionManager:
         env_vars: dict[str, str],
         hooks_dir: str | None = None,
         mcp_config: str | None = None,
+        max_turns: int | None = None,
     ):
         self._persona_dir = persona_dir
         self._env_vars = env_vars
         self._hooks_dir = hooks_dir
         self._mcp_config = mcp_config
+        self._max_turns = max_turns
+        # Serializes Claude CLI invocations; without it two concurrent DMs on
+        # different threads would race on stdin/stdout with one subprocess per
+        # call. Intentional POC trade-off — see README.
         self._lock = asyncio.Lock()
 
     def build_command(self, prompt: str, conversation_id: str | None = None) -> list[str]:
@@ -52,6 +57,8 @@ class SessionManager:
             "--output-format", "stream-json",
             "--permission-mode", "bypassPermissions",
         ]
+        if self._max_turns is not None and self._max_turns > 0:
+            cmd.extend(["--max-turns", str(self._max_turns)])
         if self._mcp_config:
             cmd.extend(["--mcp-config", self._mcp_config])
         if conversation_id:

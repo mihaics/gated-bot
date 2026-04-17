@@ -23,8 +23,9 @@ def _setup_logging():
     )
 
 
-def _run_health_checks(config) -> dict[str, bool]:
-    results = {}
+def _sync_health_checks(config) -> dict[str, bool]:
+    """Runs blocking health probes. Call from a thread via asyncio.to_thread."""
+    results: dict[str, bool] = {}
 
     try:
         env = dict(os.environ, KUBECONFIG=config.kubeconfig)
@@ -43,10 +44,24 @@ def _run_health_checks(config) -> dict[str, bool]:
     if not results["git_repo"]:
         logger.warning("Git repo path does not exist: %s", config.git_repo_path)
 
-    persona_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "persona")
+    persona_dir = config.claude.persona_dir or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "persona"
+    )
     results["persona"] = os.path.isfile(os.path.join(persona_dir, "CLAUDE.md"))
     if not results["persona"]:
         logger.warning("Persona CLAUDE.md not found at %s", persona_dir)
+
+    # The Claude Code hook must exist and settings.json must register it; if
+    # settings.json is missing, Claude Code runs in bypassPermissions with no
+    # gate at all — a known-dangerous configuration worth logging loudly.
+    hooks_settings = os.path.join(persona_dir, ".claude", "settings.json")
+    results["hook_registered"] = os.path.isfile(hooks_settings)
+    if not results["hook_registered"]:
+        logger.error(
+            "PreToolUse hook is NOT registered — %s is missing. The bot will "
+            "run without any gate on Bash commands. Refusing to start silently.",
+            hooks_settings,
+        )
 
     return results
 
@@ -57,21 +72,32 @@ async def _run():
         config = load_config(config_path)
     except (FileNotFoundError, ValueError) as e:
         logger.error("Failed to load config: %s", e)
-        sys.exit(1)
+        return 1
 
-    health = _run_health_checks(config)
+    health = await asyncio.to_thread(_sync_health_checks, config)
     health_summary = ", ".join(f"{k}: {'OK' if v else 'FAIL'}" for k, v in health.items())
     logger.info("Health checks: %s", health_summary)
+
+    if not health.get("hook_registered"):
+        logger.error("Aborting startup: PreToolUse hook not registered.")
+        return 2
 
     bot = SysOpBot(config)
 
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
+    force_quit = False
 
     def _signal_handler():
+        nonlocal force_quit
         if stop_event.is_set():
-            logger.info("Forced exit")
-            os._exit(1)
+            logger.warning("Second signal — forcing exit")
+            force_quit = True
+            # Cancel the stop_event waiter to break out immediately.
+            for task in asyncio.all_tasks(loop):
+                if task is not asyncio.current_task():
+                    task.cancel()
+            return
         logger.info("Shutdown signal received (press Ctrl+C again to force)")
         stop_event.set()
 
@@ -94,7 +120,10 @@ async def _run():
         except Exception as e:
             logger.warning("Failed to post startup message: %s", e)
 
-    await stop_event.wait()
+    try:
+        await stop_event.wait()
+    except asyncio.CancelledError:
+        pass
 
     if notify_channel:
         try:
@@ -107,16 +136,17 @@ async def _run():
     try:
         await asyncio.wait_for(bot.stop(), timeout=5.0)
     except asyncio.TimeoutError:
-        logger.warning("Shutdown timed out, forcing exit")
+        logger.warning("Shutdown timed out")
     logger.info("SysOp bot stopped")
-    os._exit(0)
+    return 1 if force_quit else 0
 
 
 def main():
     from dotenv import load_dotenv
     load_dotenv()
     _setup_logging()
-    asyncio.run(_run())
+    exit_code = asyncio.run(_run())
+    sys.exit(exit_code or 0)
 
 
 if __name__ == "__main__":

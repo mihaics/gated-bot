@@ -1,25 +1,71 @@
 ---
-# ServiceAccount for SysOp bot
+# ──────────────────────────────────────────────────────────────────────────────
+# SysOp bot RBAC
+#
+# Layered model:
+#   1. ServiceAccount          — identity the bot assumes
+#   2. ClusterRole (read)      — cluster-wide read; bound via ClusterRoleBinding
+#   3. Role       (write)      — namespace-scoped mutations; bind with one
+#                                RoleBinding per namespace you want to give
+#                                the bot write access to.
+#
+# Philosophy: read everything, mutate only in specifically enrolled namespaces,
+# and NEVER grant pods/exec, pods/portforward, or Secrets write cluster-wide.
+# Those are the three fastest escalations to cluster compromise.
+#
+# Scoping writes per-namespace turns RBAC into a real backstop: even if the
+# hook-level deny list is bypassed, the bot cannot touch namespaces it was
+# not explicitly enrolled in.
+# ──────────────────────────────────────────────────────────────────────────────
+
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: sysop-bot
   namespace: default
+
 ---
-# ClusterRole: broad read + safe write operations
-# Philosophy: read everything, mutate deployments/services/configs,
-# but NEVER touch databases (StatefulSets, PVCs) or cluster-level resources
+# Cluster-wide READ.
+# Explicit resource list — Secrets are intentionally omitted to prevent
+# cluster-wide exfiltration. Secret read is granted per-namespace via the
+# namespaced Role below.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: sysop-bot
+  name: sysop-bot-read
 rules:
-  # ── Read-only on everything ──
-  - apiGroups: ["", "apps", "batch", "networking.k8s.io", "autoscaling", "policy"]
+  - apiGroups: [""]
+    resources:
+      - configmaps
+      - endpoints
+      - events
+      - limitranges
+      - namespaces
+      - nodes
+      - persistentvolumeclaims
+      - persistentvolumes
+      - pods
+      - pods/log
+      - replicationcontrollers
+      - resourcequotas
+      - serviceaccounts
+      - services
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
     resources: ["*"]
     verbs: ["get", "list", "watch"]
-
-  # Also read CRDs, events, metrics
+  - apiGroups: ["batch"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["autoscaling"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["policy"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["apiextensions.k8s.io"]
     resources: ["customresourcedefinitions"]
     verbs: ["get", "list"]
@@ -27,81 +73,84 @@ rules:
     resources: ["nodes", "pods"]
     verbs: ["get", "list"]
 
-  # ── Pod operations (debugging) ──
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sysop-bot-read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sysop-bot-read
+subjects:
+  - kind: ServiceAccount
+    name: sysop-bot
+    namespace: default
+
+---
+# Namespace-scoped WRITE. Apply this Role + a RoleBinding in every namespace
+# where the bot should be allowed to mutate workloads. Do NOT convert this to
+# a ClusterRole — the whole point is that a compromised bot cannot walk out
+# of the namespaces you enrolled.
+#
+# Conspicuously omitted from this Role (vs. the previous version):
+#   - secrets write        : Secret exfil + write is a full cluster compromise
+#                            primitive. Handle secrets via a separate Sealed
+#                            Secrets / External Secrets Operator flow.
+#   - pods/exec            : arbitrary command execution inside any pod bypasses
+#                            every gate, including RBAC on other resources.
+#   - pods/portforward     : same story — arbitrary network reach into pods.
+#   - deployments/rollback : rolling back to an arbitrary ReplicaSet is a
+#                            stealth image swap primitive.
+#
+# If you genuinely need exec for debugging, add a separate, opt-in Role bound
+# only to the debug namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sysop-bot-write
+  namespace: REPLACE_ME  # copy this block per namespace you enroll
+rules:
+  # Read access to Secrets inside enrolled namespaces only (not cluster-wide).
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list"]
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["delete"]           # delete individual pods (triggers restart)
-  - apiGroups: [""]
-    resources: ["pods/log"]
-    verbs: ["get"]
-  - apiGroups: [""]
-    resources: ["pods/exec"]
-    verbs: ["create"]
-  - apiGroups: [""]
-    resources: ["pods/portforward"]
-    verbs: ["create"]
-
-  # ── Deployments (scale, restart, update) ──
+    verbs: ["delete"]                 # restart via delete — still noisy, but scoped
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["patch", "update"]
   - apiGroups: ["apps"]
     resources: ["deployments/scale"]
     verbs: ["patch", "update"]
-
-  # ── ConfigMaps and Secrets (update configs) ──
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["create", "patch", "update", "delete"]
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["create", "patch", "update", "delete"]
-
-  # ── Services and Ingresses ──
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["create", "patch", "update", "delete"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses"]
     verbs: ["create", "patch", "update", "delete"]
-
-  # ── HPA (adjust autoscaling) ──
   - apiGroups: ["autoscaling"]
     resources: ["horizontalpodautoscalers"]
     verbs: ["create", "patch", "update", "delete"]
-
-  # ── Jobs and CronJobs ──
   - apiGroups: ["batch"]
     resources: ["jobs", "cronjobs"]
     verbs: ["create", "patch", "update", "delete"]
 
-  # ── Rollouts ──
-  - apiGroups: ["apps"]
-    resources: ["deployments/rollback"]
-    verbs: ["create"]
-
-  # ─────────────────────────────────────────────
-  # EXPLICITLY NOT GRANTED (deny by omission):
-  # - StatefulSets: no create/update/delete/patch
-  # - PersistentVolumeClaims: no create/update/delete
-  # - PersistentVolumes: no create/update/delete
-  # - Namespaces: no create/delete
-  # - Nodes: no cordon/drain/delete
-  # - ClusterRoles/ClusterRoleBindings: no mutation
-  # - DaemonSets: no mutation
-  # - ServiceAccounts: no mutation
-  # - CRDs: no mutation
-  # ─────────────────────────────────────────────
 ---
-# Bind the ClusterRole to the ServiceAccount
+# Example per-namespace binding. Copy once per namespace the bot should write in.
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
+kind: RoleBinding
 metadata:
-  name: sysop-bot
+  name: sysop-bot-write
+  namespace: REPLACE_ME
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: sysop-bot
+  kind: Role
+  name: sysop-bot-write
 subjects:
   - kind: ServiceAccount
     name: sysop-bot

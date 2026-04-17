@@ -5,8 +5,13 @@ config.yaml
 .env
 *.db
 /tmp/
-.claude/
 *.egg-info/
 dist/
 uv.lock
 mcp/openbrain.json
+
+# Claude Code settings are globally ignored (per-user state, local overrides)
+.claude/
+# ...except the persona's checked-in hook registration, which must ship
+!persona/.claude/
+!persona/.claude/**

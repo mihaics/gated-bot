@@ -28,6 +28,31 @@ class TestSessionManager:
         assert "--mcp-config" not in cmd
 
     @pytest.mark.asyncio
+    async def test_build_command_passes_max_turns(self):
+        from sysop.session import SessionManager
+
+        sm = SessionManager(
+            persona_dir="/tmp/persona",
+            env_vars={},
+            max_turns=42,
+        )
+        cmd = sm.build_command("anything", conversation_id=None)
+        assert "--max-turns" in cmd
+        idx = cmd.index("--max-turns")
+        assert cmd[idx + 1] == "42"
+
+    @pytest.mark.asyncio
+    async def test_build_command_skips_max_turns_when_unset(self):
+        from sysop.session import SessionManager
+
+        sm = SessionManager(
+            persona_dir="/tmp/persona",
+            env_vars={},
+        )
+        cmd = sm.build_command("anything", conversation_id=None)
+        assert "--max-turns" not in cmd
+
+    @pytest.mark.asyncio
     async def test_build_command_with_mcp_config(self):
         from sysop.session import SessionManager
 

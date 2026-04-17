@@ -1,7 +1,15 @@
-"""SQLite-backed audit log and session persistence."""
+"""SQLite-backed audit log and session persistence.
+
+Security note: this database is effectively a secrets store. It records
+the full command text Claude ran (including any secrets embedded in
+flags like `--from-literal=x=<token>`) and the raw JSON from the Claude
+Code result event (which may contain credentials Claude summarized in its
+reply). Treat the .db file with the same sensitivity as .ssh/.
+"""
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 
 import aiosqlite
@@ -15,6 +23,12 @@ class AuditDB:
     async def initialize(self) -> None:
         self._db = await aiosqlite.connect(self._db_path)
         self._db.row_factory = aiosqlite.Row
+        # Lock the file to the owner. Best-effort: errors (e.g. Windows, exotic
+        # filesystems) are non-fatal — log at caller's discretion.
+        try:
+            os.chmod(self._db_path, 0o600)
+        except OSError:
+            pass
         await self._db.executescript("""
             CREATE TABLE IF NOT EXISTS audit_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

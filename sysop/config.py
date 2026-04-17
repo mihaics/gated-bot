@@ -35,6 +35,25 @@ class SlackConfig:
     bot_token: str
 
 
+_DEFAULT_BASH_READ_ALLOWLIST = [
+    "ls", "cat", "echo", "printf", "pwd", "whoami", "id", "hostname",
+    "head", "tail", "wc", "grep", "egrep", "fgrep", "rgrep",
+    "less", "more", "file", "stat", "basename", "dirname",
+    "realpath", "readlink", "which", "type", "tree",
+    "jq", "yq", "awk", "sed", "sort", "uniq", "cut", "tr",
+    "column", "paste", "fold", "rev", "nl", "od", "hexdump", "xxd",
+    "base64", "date", "cal",
+    "ps", "top", "htop", "free", "uptime", "uname", "env", "printenv",
+    "df", "du", "seq", "true", "false", "expr", "bc", "test", "[",
+    "kubectl", "git", "helm",
+]
+
+_DEFAULT_BASH_DENY = [
+    "shutdown", "reboot", "halt", "poweroff",
+    "mkfs", "mkfs.ext4", "mkfs.ext3", "mkfs.xfs", "mkfs.btrfs", "mkfs.vfat",
+]
+
+
 @dataclass
 class GatesConfig:
     timeout_seconds: int = 300
@@ -48,8 +67,11 @@ class GatesConfig:
             "delete clusterrolebinding", "delete pv", "delete node",
         ]
     )
-    bash_gate_patterns: list[str] = field(
-        default_factory=lambda: ["kubectl", "git", "helm"]
+    bash_read_allowlist: list[str] = field(
+        default_factory=lambda: list(_DEFAULT_BASH_READ_ALLOWLIST)
+    )
+    bash_deny_commands: list[str] = field(
+        default_factory=lambda: list(_DEFAULT_BASH_DENY)
     )
 
 
@@ -64,6 +86,11 @@ class SessionConfig:
 class ClaudeConfig:
     max_turns: int = 50
     persona_claude_md: str = "./persona/CLAUDE.md"
+    # Override paths. When empty, the bot falls back to the in-tree layout
+    # (repo-root/persona, repo-root/hooks). Set these when running from an
+    # installed wheel where __file__ points into site-packages.
+    persona_dir: str = ""
+    hooks_dir: str = ""
 
 
 @dataclass

@@ -24,11 +24,17 @@ gates:
   require_initiator_approval: true
   kubectl_read_commands: [get, describe, logs, top, explain, api-resources]
   kubectl_deny_commands: [delete namespace, delete clusterrole, delete clusterrolebinding, delete pv, delete node]
-  bash_gate_patterns: [kubectl, git, helm]
+  # bash_read_allowlist and bash_deny_commands use the built-in defaults
+  # (see sysop/config.py). Override only if you need to narrow or widen them.
+  # bash_read_allowlist: [ls, cat, echo, ...]
+  # bash_deny_commands:  [shutdown, reboot, mkfs, ...]
 
 claude:
   max_turns: 50
   persona_claude_md: ./persona/CLAUDE.md
+  # When running from a wheel (not an in-tree checkout), set these explicitly:
+  # persona_dir: /opt/sysop/persona
+  # hooks_dir:   /opt/sysop/hooks
 
 session:
   idle_timeout_seconds: 1800

@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from collections import defaultdict
@@ -19,6 +20,7 @@ from slack_sdk.errors import SlackApiError
 from sysop.audit import AuditDB
 from sysop.config import Config
 from sysop.gates import GateManager
+from sysop.redact import sanitize_for_slack
 from sysop.session import SessionManager, StreamEvent
 
 logger = logging.getLogger("sysop.bot")
@@ -29,7 +31,7 @@ class ThreadState:
     """Per-thread state tracking."""
     queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=3))
     processing: bool = False
-    listen_task: asyncio.Task | None = None
+    gate_task: asyncio.Task | None = None
     last_activity: float = field(default_factory=time.monotonic)
 
 
@@ -125,8 +127,16 @@ class SysOpBot:
         self._idle_cleanup_task: asyncio.Task | None = None
         self._threads: dict[str, ThreadState] = defaultdict(ThreadState)
 
+        # Track the initiator of the most recent message on each thread, so the
+        # per-thread gate handler can route approval requests to Slack under
+        # the right attribution.
+        self._thread_initiator: dict[str, str] = {}
+        self._thread_channel: dict[str, str] = {}
+
         self._audit = AuditDB(config.audit.db_path)
         self._gates = GateManager(socket_dir=config.session.socket_dir)
+
+        gate_hook_timeout = float(config.gates.timeout_seconds) + 30.0
         self._session_mgr = SessionManager(
             persona_dir=self._resolve_persona_dir(),
             env_vars={
@@ -136,22 +146,29 @@ class SysOpBot:
                 "SYSOP_GATE_CONFIG": json.dumps({
                     "kubectl_read_commands": config.gates.kubectl_read_commands,
                     "kubectl_deny_commands": config.gates.kubectl_deny_commands,
-                    "bash_gate_patterns": config.gates.bash_gate_patterns,
+                    "bash_read_allowlist": config.gates.bash_read_allowlist,
+                    "bash_deny_commands": config.gates.bash_deny_commands,
+                    "gate_hook_timeout": gate_hook_timeout,
                 }),
             },
             hooks_dir=self._resolve_hooks_dir(),
             mcp_config=config.openbrain.mcp_config or None,
+            max_turns=config.claude.max_turns,
         )
 
         self._register_handlers()
 
     def _resolve_persona_dir(self) -> str:
-        import os
+        override = self._config.claude.persona_dir
+        if override:
+            return override
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         return os.path.join(project_root, "persona")
 
     def _resolve_hooks_dir(self) -> str:
-        import os
+        override = self._config.claude.hooks_dir
+        if override:
+            return override
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         return os.path.join(project_root, "hooks")
 
@@ -206,6 +223,11 @@ class SysOpBot:
                 thread_ts=thread_ts,
             )
 
+        # Record who most recently activated this thread. The persistent
+        # gate handler uses this to attribute approval prompts back to them.
+        self._thread_initiator[thread_ts] = user
+        self._thread_channel[thread_ts] = channel
+
         await thread_state.queue.put({
             "text": text,
             "user": user,
@@ -227,6 +249,20 @@ class SysOpBot:
         finally:
             thread_state.processing = False
 
+    async def _ensure_thread_socket(self, thread_ts: str) -> str:
+        """Create the per-thread gate socket (server already listening when this
+        returns) and start the gate-request handler if it doesn't already exist."""
+        existing = self._gates.get_socket_path(thread_ts)
+        if existing:
+            return existing
+
+        socket_path = await self._gates.create_socket(thread_ts)
+        thread_state = self._threads[thread_ts]
+        thread_state.gate_task = asyncio.create_task(
+            self._handle_gate_requests(thread_ts)
+        )
+        return socket_path
+
     async def _process_message(self, msg: dict):
         text = msg["text"]
         user = msg["user"]
@@ -237,17 +273,7 @@ class SysOpBot:
 
         self._threads[thread_ts].last_activity = time.monotonic()
 
-        socket_path = self._gates.get_socket_path(thread_ts)
-        if not socket_path:
-            socket_path = await self._gates.create_socket(thread_ts)
-            thread_state = self._threads[thread_ts]
-            thread_state.listen_task = asyncio.create_task(
-                self._gates.start_listening(thread_ts)
-            )
-
-        gate_handler_task = asyncio.create_task(
-            self._handle_gate_requests(thread_ts, channel, user)
-        )
+        socket_path = await self._ensure_thread_socket(thread_ts)
 
         conversation_id = await self._audit.get_session(thread_ts)
 
@@ -306,25 +332,32 @@ class SysOpBot:
                 await client.reactions_add(channel=channel, timestamp=message_ts, name="x")
             except Exception:
                 pass
-        finally:
-            gate_handler_task.cancel()
-            try:
-                await gate_handler_task
-            except asyncio.CancelledError:
-                pass
 
-    async def _handle_gate_requests(self, thread_ts: str, channel: str, initiator_user: str):
+    async def _handle_gate_requests(self, thread_ts: str):
+        """Long-running per-thread task: pulls gate requests off the queue
+        and posts Slack approval prompts. Lives as long as the thread's socket."""
         try:
             while True:
                 request = await self._gates.wait_for_request(thread_ts)
                 command = request.get("command", "unknown command")
+                request_id = request.get("_request_id", "")
+                initiator = self._thread_initiator.get(thread_ts, "")
+                channel = self._thread_channel.get(thread_ts, "")
+
+                display_cmd = sanitize_for_slack(command)
+
+                button_value = json.dumps({
+                    "thread_ts": thread_ts,
+                    "request_id": request_id,
+                    "initiator": initiator,
+                })
 
                 blocks = [
                     {
                         "type": "section",
                         "text": {
                             "type": "mrkdwn",
-                            "text": f":warning: *Action requires approval:*\n```{command}```",
+                            "text": f":warning: *Action requires approval:*\n```{display_cmd}```",
                         },
                     },
                     {
@@ -335,36 +368,31 @@ class SysOpBot:
                                 "text": {"type": "plain_text", "text": "Approve"},
                                 "style": "primary",
                                 "action_id": "sysop_approve",
-                                "value": json.dumps({
-                                    "thread_ts": thread_ts,
-                                    "command": command,
-                                    "initiator": initiator_user,
-                                }),
+                                "value": button_value,
                             },
                             {
                                 "type": "button",
                                 "text": {"type": "plain_text", "text": "Deny"},
                                 "style": "danger",
                                 "action_id": "sysop_deny",
-                                "value": json.dumps({
-                                    "thread_ts": thread_ts,
-                                    "command": command,
-                                    "initiator": initiator_user,
-                                }),
+                                "value": button_value,
                             },
                         ],
                     },
                 ]
 
-                await self._app.client.chat_postMessage(
-                    channel=channel,
-                    thread_ts=thread_ts,
-                    text=f"Action requires approval: {command}",
-                    blocks=blocks,
-                )
+                try:
+                    await self._app.client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text="Action requires approval",
+                        blocks=blocks,
+                    )
+                except Exception:
+                    logger.exception("Failed to post gate prompt")
 
                 await self._audit.log_action(
-                    slack_user=initiator_user,
+                    slack_user=initiator,
                     slack_thread=thread_ts,
                     action_type="gate",
                     tool_name="Bash",
@@ -372,26 +400,30 @@ class SysOpBot:
                 )
 
                 asyncio.create_task(
-                    self._gate_timeout(thread_ts, self._config.gates.timeout_seconds)
+                    self._gate_timeout(request_id, self._config.gates.timeout_seconds)
                 )
 
         except asyncio.CancelledError:
             return
 
-    async def _gate_timeout(self, thread_ts: str, timeout: float):
+    async def _gate_timeout(self, request_id: str, timeout: float):
         await asyncio.sleep(timeout)
-        await self._gates.resolve_if_pending(thread_ts, "denied")
+        await self._gates.resolve(request_id, "denied")
 
     async def _handle_gate_action(self, body: dict, decision: str, client: AsyncWebClient):
         action = body.get("actions", [{}])[0]
-        value = json.loads(action.get("value", "{}"))
+        try:
+            value = json.loads(action.get("value", "{}"))
+        except json.JSONDecodeError:
+            value = {}
         thread_ts = value.get("thread_ts", "")
-        command = value.get("command", "")
+        request_id = value.get("request_id", "")
         initiator = value.get("initiator", "")
         clicking_user = body.get("user", {}).get("id", "")
+        channel = body.get("channel", {}).get("id", "")
+        message_ts = body.get("message", {}).get("ts", "")
 
         if self._config.gates.require_initiator_approval and clicking_user != initiator:
-            channel = body.get("channel", {}).get("id", "")
             await client.chat_postMessage(
                 channel=channel,
                 thread_ts=thread_ts,
@@ -399,37 +431,47 @@ class SysOpBot:
             )
             return
 
-        await self._gates.resolve(thread_ts, decision)
+        resolved = await self._gates.resolve(request_id, decision)
+        if not resolved:
+            # Already resolved (timeout or duplicate click) — still update the
+            # card so the user isn't staring at stale buttons.
+            try:
+                await client.chat_update(
+                    channel=channel,
+                    ts=message_ts,
+                    text="Request already resolved",
+                    blocks=[{
+                        "type": "section",
+                        "text": {"type": "mrkdwn", "text": ":hourglass: Request already resolved."},
+                    }],
+                )
+            except Exception:
+                pass
+            return
 
         await self._audit.log_action(
             slack_user=initiator,
             slack_thread=thread_ts,
             action_type="gate",
             tool_name="Bash",
-            tool_input=command,
             gate_result=decision,
             approved_by=clicking_user,
         )
 
-        channel = body.get("channel", {}).get("id", "")
-        message_ts = body.get("message", {}).get("ts", "")
         status_text = "Approved" if decision == "approved" else "Denied"
         status_emoji = ":white_check_mark:" if decision == "approved" else ":x:"
-
         try:
             await client.chat_update(
                 channel=channel,
                 ts=message_ts,
-                text=f"{status_emoji} {status_text}: `{command}`",
-                blocks=[
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": f"{status_emoji} *{status_text}* by <@{clicking_user}>:\n```{command}```",
-                        },
+                text=f"{status_emoji} {status_text} by <@{clicking_user}>",
+                blocks=[{
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"{status_emoji} *{status_text}* by <@{clicking_user}>",
                     },
-                ],
+                }],
             )
         except Exception:
             pass
@@ -462,8 +504,27 @@ class SysOpBot:
                     text=f"{prefix}{chunk}",
                 )
 
+    async def _cleanup_thread(self, thread_ts: str) -> None:
+        """Tear down a thread's socket and gate handler."""
+        state = self._threads.get(thread_ts)
+        if state is None:
+            return
+        if state.gate_task:
+            state.gate_task.cancel()
+            try:
+                await state.gate_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.warning("Gate task errored during thread cleanup", exc_info=True)
+        # Resolve any still-pending gates so hook subprocesses unblock.
+        await self._gates.resolve_all_for_thread(thread_ts, "denied")
+        await self._gates.remove_socket(thread_ts)
+        self._thread_initiator.pop(thread_ts, None)
+        self._thread_channel.pop(thread_ts, None)
+        self._threads.pop(thread_ts, None)
+
     async def _idle_cleanup_loop(self):
-        """Periodically clean up idle thread sessions."""
         idle_timeout = self._config.session.idle_timeout_seconds
         while True:
             await asyncio.sleep(60)
@@ -474,14 +535,7 @@ class SysOpBot:
                     continue
                 if now - state.last_activity > idle_timeout:
                     logger.info("Cleaning up idle session for thread %s", thread_ts)
-                    if state.listen_task:
-                        state.listen_task.cancel()
-                        try:
-                            await state.listen_task
-                        except asyncio.CancelledError:
-                            pass
-                    await self._gates.remove_socket(thread_ts)
-                    del self._threads[thread_ts]
+                    await self._cleanup_thread(thread_ts)
 
     async def start(self):
         await self._audit.initialize()
@@ -498,14 +552,7 @@ class SysOpBot:
                 pass
 
         for thread_ts in list(self._threads.keys()):
-            state = self._threads[thread_ts]
-            if state.listen_task:
-                state.listen_task.cancel()
-                try:
-                    await state.listen_task
-                except asyncio.CancelledError:
-                    pass
-            await self._gates.remove_socket(thread_ts)
+            await self._cleanup_thread(thread_ts)
 
         if self._handler:
             try:
